@@ -1,6 +1,19 @@
 export type AttendanceStatus = 'PRESENT' | 'RETARD' | 'ABSENT';
 
-export type UserRole = 'ADMIN' | 'SECRETAIRE' | 'RH' | 'DIRECTEUR';
+// Identifiant de rôle : les 4 rôles de base plus les rôles créés par l'administrateur
+export type UserRole = string;
+
+export type AppModule = 'dashboard' | 'employees' | 'attendance' | 'reports' | 'sanctions' | 'settings';
+export type PermissionAction = 'view' | 'create' | 'edit' | 'delete' | 'export' | 'validate';
+export type ModulePermissions = Record<AppModule, PermissionAction[]>;
+
+export interface RoleDefinition {
+  id: UserRole;
+  label: string;
+  description: string;
+  permissions: ModulePermissions;
+  system?: boolean; // rôle de base, ne peut pas être supprimé
+}
 
 export interface User {
   id: string;
@@ -9,6 +22,8 @@ export interface User {
   role: UserRole;
   avatar?: string;
   department?: string;
+  active?: boolean; // false = compte désactivé, connexion refusée
+  passwordHash?: string; // empreinte SHA-256 ; absente = mot de passe initial
 }
 
 export type AdministrativeStatus = 'ACTIF' | 'INACTIF' | 'SUSPENDU';
@@ -101,12 +116,24 @@ export interface ZKTecoDeviceConfig {
   syncLogs: SyncLogEntry[];
 }
 
-export type SanctionLevel = 
+// Trois sanctions seulement : avertissement verbal, retenue compensatoire sur salaire, exclusion temporaire
+export type SanctionLevel =
   | 'AVERTISSEMENT_VERBAL'
-  | 'AVERTISSEMENT_ECRIT'
-  | 'BLAME'
-  | 'MISE_A_PIED_PROPOSEE'
-  | 'RETENUE_SALARIALE_PROPOSEE';
+  | 'RETENUE_SALARIALE_PROPOSEE'
+  | 'EXCLUSION_TEMPORAIRE';
+
+export const SANCTION_LABELS: Record<SanctionLevel, string> = {
+  RETENUE_SALARIALE_PROPOSEE: 'Retenue compensatoire sur salaire',
+  AVERTISSEMENT_VERBAL: 'Avertissement verbal',
+  EXCLUSION_TEMPORAIRE: 'Exclusion temporaire du travail',
+};
+
+/** Anciennes sanctions (blâme, avertissement écrit, mise à pied) ramenées aux trois sanctions retenues */
+export function normalizeSanctionLevel(level: string, deductionAmount = 0): SanctionLevel {
+  if (level === 'AVERTISSEMENT_VERBAL' || level === 'RETENUE_SALARIALE_PROPOSEE' || level === 'EXCLUSION_TEMPORAIRE') return level;
+  if (level === 'MISE_A_PIED_PROPOSEE') return 'EXCLUSION_TEMPORAIRE';
+  return deductionAmount > 0 ? 'RETENUE_SALARIALE_PROPOSEE' : 'AVERTISSEMENT_VERBAL';
+}
 
 export type SanctionTargetType = 'RETARD' | 'ABSENCE' | 'COMBINE';
 
@@ -121,6 +148,7 @@ export interface SanctionRule {
   sanctionType: SanctionLevel;
   deductionAmount: number; // Somme d'argent retirable / déductible
   currency: 'USD' | 'CDF';
+  exclusionDays?: number; // Exclusion temporaire du travail : nombre de jours
   isActive: boolean;
   effectiveDate: string;
   description: string;

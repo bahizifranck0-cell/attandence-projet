@@ -7,7 +7,7 @@ export const INITIAL_COMPANY_SETTINGS: CompanySettings = {
   rccm: "CD/GOM/RCCM/14-B-0203",
   phone: "+243 965 538 258",
   whatsapp: "+243 910 042 575",
-  email: "breezyjovial1@gmail.com",
+  email: "", // à renseigner dans Paramètres › Entreprise
   timezone: "Africa/Lubumbashi (CAT / GMT+2)",
   defaultExpectedCheckIn: "08:30",
   defaultExpectedCheckOut: "16:30",
@@ -519,6 +519,12 @@ export function generateMockAttendance(): AttendanceRecord[] {
   // PRM-019 (Clovis) has lates
   // PRM-014 (Erick) has lates
   
+  // HH:MM à partir d'une heure et de minutes qui peuvent sortir de 0–59 (08:00 − 4 min → 07:56)
+  const clock = (h: number, m: number) => {
+    const t = h * 60 + m;
+    return `${String(Math.floor(t / 60)).padStart(2, '0')}:${String(t % 60).padStart(2, '0')}`;
+  };
+
   dates.forEach((date, dateIdx) => {
     employees.forEach((emp) => {
       const isToday = (date === '2026-10-11');
@@ -550,7 +556,7 @@ export function generateMockAttendance(): AttendanceRecord[] {
           notes = 'Embouteillage rond-point BDGL';
         } else {
           status = 'PRESENT';
-          actualCheckIn = `${String(expH).padStart(2, '0')}:${String(expM - 5).padStart(2, '0')}`;
+          actualCheckIn = clock(expH, expM - 5);
           actualCheckOut = '16:32';
         }
       } else if (emp.matricule === 'PRM-019') {
@@ -558,11 +564,11 @@ export function generateMockAttendance(): AttendanceRecord[] {
         if ([1, 4, 6, 9].includes(dateIdx)) {
           status = 'RETARD';
           lateMinutes = 22;
-          actualCheckIn = `${String(expH).padStart(2, '0')}:${String(expM + 22).padStart(2, '0')}`;
+          actualCheckIn = clock(expH, expM + 22);
           actualCheckOut = '16:02';
         } else {
           status = 'PRESENT';
-          actualCheckIn = `${String(expH).padStart(2, '0')}:${String(expM - 4).padStart(2, '0')}`;
+          actualCheckIn = clock(expH, expM - 4);
           actualCheckOut = '16:05';
         }
       } else if (emp.matricule === 'PRM-008') {
@@ -685,7 +691,7 @@ export const INITIAL_SANCTION_RULES: SanctionRule[] = [
     thresholdLateCount: 6,
     thresholdLateMinutes: 90,
     thresholdAbsenceCount: 0,
-    sanctionType: "BLAME",
+    sanctionType: "RETENUE_SALARIALE_PROPOSEE",
     deductionAmount: 25,
     currency: "USD",
     isActive: true,
@@ -715,7 +721,7 @@ export const INITIAL_SANCTION_RULES: SanctionRule[] = [
     thresholdLateCount: 0,
     thresholdLateMinutes: 0,
     thresholdAbsenceCount: 2,
-    sanctionType: "BLAME",
+    sanctionType: "RETENUE_SALARIALE_PROPOSEE",
     deductionAmount: 45,
     currency: "USD",
     isActive: true,
@@ -788,7 +794,7 @@ export const INITIAL_SANCTION_CASES: SanctionCase[] = [
     datesAbsent: ["2026-10-06", "2026-10-07"],
     ruleId: "rule-5",
     ruleName: "Absences Répétées Non Justifiées (≥ 2 journées)",
-    proposedSanction: "BLAME",
+    proposedSanction: "RETENUE_SALARIALE_PROPOSEE",
     deductionAmount: 45,
     approvedDeductionAmount: 45,
     currency: "USD",
@@ -827,11 +833,11 @@ export const INITIAL_SANCTION_CASES: SanctionCase[] = [
 
 export const INITIAL_ZKTECO_CONFIG: ZKTecoDeviceConfig = {
   brand: "ZKTeco",
-  model: "ZKTeco uFace800 Plus (Biométrie Empreinte & Facial)",
+  model: "ZKTeco F19 (empreinte digitale, clavier, export clé USB)",
   ipAddress: "192.168.1.201",
   port: 4370,
   commKey: "0",
-  connectionType: "DIRECT_TCP",
+  connectionType: "USB_FILE",
   status: "ONLINE",
   lastSyncTime: "2026-10-11 08:35:12",
   lastPunchImportedTime: "2026-10-11 08:34:45",

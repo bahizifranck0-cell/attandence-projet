@@ -1,27 +1,28 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
+import { ReportsView } from '../reports/ReportsView';
+import { exportPreviewToPdf } from '../../utils/pdfLoader';
 import { useApp } from '../../context/AppContext';
+import { EmployeeAvatar } from '../common/EmployeeAvatar';
+import { EmployeeCarnet } from './EmployeeCarnet';
 import { AttendanceRecord, AttendanceStatus } from '../../types';
 import { StatusBadge, CodeBadge } from '../common/Badge';
-import { 
-  Calendar, Search, Filter, Download, Printer, 
-  Edit3, Plus, CheckCircle2, AlertTriangle, Clock, RefreshCw, FileText, ChevronLeft, ChevronRight
-} from 'lucide-react';
-import { exportToExcel, generateAttendancePdf } from '../../utils/exportUtils';
+import { Calendar, Search, FileText } from 'lucide-react';
+import { generateAttendancePdf } from '../../utils/pdfLoader';
 
 interface AttendanceViewProps {
-  onOpenQuickPunch: () => void;
   onOpenCorrectModal: (record: AttendanceRecord) => void;
 }
 
 export const AttendanceView: React.FC<AttendanceViewProps> = ({
-  onOpenQuickPunch,
   onOpenCorrectModal
 }) => {
-  const { attendanceRecords, employees, departments, companySettings } = useApp();
+  const { attendanceRecords, employees, departments, workingDate, carnetEmployee, openEmployeeCarnet, can } = useApp();
+  const canEdit = can('attendance', 'edit');
+  const canExport = can('attendance', 'export');
 
   const [activeTab, setActiveTab] = useState<'DAILY' | 'MONTHLY_GRID'>('DAILY');
-  const [selectedDate, setSelectedDate] = useState('2026-10-11');
-  const [selectedMonth, setSelectedMonth] = useState('2026-10'); // YYYY-MM
+  const [selectedDate, setSelectedDate] = useState(workingDate);
+  const [selectedMonth, setSelectedMonth] = useState(workingDate.slice(0, 7)); // AAAA-MM, mois de la date de travail
   const [selectedDepartment, setSelectedDepartment] = useState('ALL');
   const [selectedStatus, setSelectedStatus] = useState<'ALL' | AttendanceStatus>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
@@ -43,10 +44,16 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
     });
   }, [dailyRecords, selectedStatus, selectedDepartment, searchQuery]);
 
-  // Monthly Grid Data (J1 to J31)
+  // Nombre réel de jours du mois choisi (28 à 31)
+  const monthDays = useMemo(() => {
+    const [y, m] = selectedMonth.split('-').map(Number);
+    return Array.from({ length: new Date(Date.UTC(y, m, 0)).getUTCDate() }, (_, i) => i + 1);
+  }, [selectedMonth]);
+
+  // Grille mensuelle J1 à la fin du mois
   const monthlySynthesis = useMemo(() => {
-    const daysInMonth = 31; // October has 31 days
-    const monthPrefix = selectedMonth; // e.g. "2026-10"
+    const daysInMonth = monthDays.length;
+    const monthPrefix = selectedMonth; // ex. "2026-10"
 
     // Group records by employee
     return employees.map((emp, index) => {
@@ -92,66 +99,40 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         row.employee.matricule.toLowerCase().includes(searchQuery.toLowerCase());
       return matchDep && matchSearch;
     });
-  }, [employees, attendanceRecords, selectedMonth, selectedDepartment, searchQuery]);
+  }, [employees, attendanceRecords, selectedMonth, monthDays, selectedDepartment, searchQuery]);
 
   // Export handlers
-  const handleExportDailyExcel = () => {
-    const data = filteredDailyList.map(r => ({
-      Matricule: r.employeeId,
-      'Nom Complet': r.employeeName,
-      Département: r.department,
-      Date: r.date,
-      'Entrée Prévue': r.expectedCheckIn,
-      'Entrée Constatée': r.actualCheckIn || '–',
-      'Retard (min)': r.lateMinutes,
-      'Sortie Prévue': r.expectedCheckOut,
-      'Sortie Constatée': r.actualCheckOut || '–',
-      Statut: r.status,
-      Source: r.source,
-      Observations: r.notes || (r.isCorrected ? 'Corrigé manuellement' : '')
-    }));
-    exportToExcel(data, `Carnet_Presence_Journalier_${selectedDate}`);
-  };
-
   const handleExportDailyPdf = () => {
     generateAttendancePdf(
       `Carnet de Présence – ${selectedDate}`,
       filteredDailyList,
-      companySettings,
       `Service : ${selectedDepartment === 'ALL' ? 'Tous départements' : selectedDepartment} · Commune de Karisimbi`
     );
   };
 
-  const handleExportMonthlyExcel = () => {
-    const data = monthlySynthesis.map(row => {
-      const rowObj: any = {
-        'N°': row.number,
-        Matricule: row.employee.matricule,
-        'Nom & Postnom': `${row.employee.nom} ${row.employee.postnom} ${row.employee.prenom}`,
-        Département: row.employee.departement
-      };
-      for (let day = 1; day <= 31; day++) {
-        const rec = row.days[day];
-        rowObj[`J${day}`] = rec ? rec.status.charAt(0) : '–';
-      }
-      rowObj['Total Présents (P)'] = row.totalP;
-      rowObj['Total Retards (R)'] = row.totalR;
-      rowObj['Total Absents (A)'] = row.totalA;
-      rowObj['Total Retard (min)'] = row.totalLateMin;
-      return rowObj;
-    });
-    exportToExcel(data, `Synthese_Mensuelle_${selectedMonth}`, 'Synthese_Mensuelle');
-  };
+  // Même document que Rapports › Mois (en-tête officiel, bilan, grille J1-J31), préparé hors écran puis exporté
+  const [exportingMonthly, setExportingMonthly] = useState(false);
+  const handleMonthlyDocumentReady = useCallback(async (el: HTMLDivElement, title: string) => {
+    try {
+      await exportPreviewToPdf(el, title);
+    } finally {
+      setExportingMonthly(false);
+    }
+  }, []);
+
+  if (carnetEmployee) {
+    return <EmployeeCarnet matricule={carnetEmployee} onClose={() => openEmployeeCarnet(null)} onOpenCorrectModal={onOpenCorrectModal} />;
+  }
 
   return (
     <div className="space-y-6">
       {/* Top Header */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-black text-[#1D2030] dark:text-white tracking-tight">
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
             Carnet de Présence du Personnel
           </h1>
-          <p className="text-xs text-[#717787] dark:text-gray-400 mt-1">
+          <p className="text-xs text-muted mt-1">
             Relevé officiel des pointages journaliers et carnet de synthèse mensuelle (J1 - J31)
           </p>
         </div>
@@ -159,13 +140,13 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         {/* Action Controls */}
         <div className="flex flex-wrap items-center gap-2.5">
           {/* Tab Switcher: Daily vs Monthly */}
-          <div className="p-1 bg-gray-200/80 dark:bg-gray-800 rounded-xl flex items-center text-xs font-bold shadow-2xs">
+          <div className="p-1 bg-slate-200/80 rounded-xl flex items-center text-xs font-bold shadow-2xs">
             <button
               onClick={() => setActiveTab('DAILY')}
               className={`px-3 py-1.5 rounded-lg transition-all ${
                 activeTab === 'DAILY'
-                  ? 'bg-white dark:bg-gray-900 text-[#7C4DFF] shadow-xs'
-                  : 'text-gray-600 dark:text-gray-400 hover:text-gray-900'
+                  ? 'bg-white text-brand shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
               }`}
             >
               Registre Journalier
@@ -174,21 +155,14 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
               onClick={() => setActiveTab('MONTHLY_GRID')}
               className={`px-3 py-1.5 rounded-lg transition-all ${
                 activeTab === 'MONTHLY_GRID'
-                  ? 'bg-white dark:bg-gray-900 text-[#7C4DFF] shadow-xs'
-                  : 'text-gray-600 dark:text-gray-400 hover:text-gray-900'
+                  ? 'bg-white text-brand shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Synthèse Mensuelle (J1 - J31)
+              Synthèse Mensuelle (J1 - J{monthDays.length})
             </button>
           </div>
 
-          <button
-            onClick={onOpenQuickPunch}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[#7C4DFF] text-white hover:bg-[#6a38f3] text-xs font-semibold shadow-sm transition-all"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Pointer une présence</span>
-          </button>
         </div>
       </div>
 
@@ -196,23 +170,23 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
       <div className="p-4 rounded-2xl glass-card flex flex-wrap items-center justify-between gap-3 text-xs">
         <div className="flex flex-wrap items-center gap-3">
           {activeTab === 'DAILY' ? (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
-              <Calendar className="w-3.5 h-3.5 text-[#7C4DFF]" />
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200">
+              <Calendar className="w-3.5 h-3.5 text-brand" />
               <input
                 type="date"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                className="bg-transparent outline-none font-mono cursor-pointer text-gray-900 dark:text-white font-semibold"
+                className="bg-transparent outline-none font-mono cursor-pointer text-slate-900 font-semibold"
               />
             </div>
           ) : (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
-              <Calendar className="w-3.5 h-3.5 text-[#7C4DFF]" />
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-100 border border-slate-200">
+              <Calendar className="w-3.5 h-3.5 text-brand" />
               <input
                 type="month"
                 value={selectedMonth}
                 onChange={(e) => setSelectedMonth(e.target.value)}
-                className="bg-transparent outline-none font-mono cursor-pointer text-gray-900 dark:text-white font-semibold"
+                className="bg-transparent outline-none font-mono cursor-pointer text-slate-900 font-semibold"
               />
             </div>
           )}
@@ -221,7 +195,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
           <select
             value={selectedDepartment}
             onChange={(e) => setSelectedDepartment(e.target.value)}
-            className="px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 font-medium outline-none cursor-pointer border border-gray-200 dark:border-gray-700"
+            className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-800 font-medium outline-none cursor-pointer border border-slate-200"
           >
             <option value="ALL">Tous les départements</option>
             {departments.map(d => (
@@ -234,7 +208,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
             <select
               value={selectedStatus}
               onChange={(e) => setSelectedStatus(e.target.value as any)}
-              className="px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-200 font-medium outline-none cursor-pointer border border-gray-200 dark:border-gray-700"
+              className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-800 font-medium outline-none cursor-pointer border border-slate-200"
             >
               <option value="ALL">Tous les statuts</option>
               <option value="PRESENT">Présent (P)</option>
@@ -250,42 +224,35 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
               placeholder="Rechercher nom, matricule..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-48 sm:w-60 pl-8 pr-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-400 outline-none border border-gray-200 dark:border-gray-700 focus:ring-1 focus:ring-[#7C4DFF]"
+              className="w-48 sm:w-60 pl-8 pr-3 py-1.5 rounded-xl bg-slate-100 text-slate-900 placeholder-slate-400 outline-none border border-slate-200 focus:ring-1 focus:ring-brand"
             />
-            <Search className="w-3.5 h-3.5 text-gray-400 absolute left-2.5 top-2.5" />
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2.5" />
           </div>
         </div>
 
         {/* Export Buttons */}
         <div className="flex items-center gap-2">
-          {activeTab === 'DAILY' ? (
+          {!canExport ? null : activeTab === 'DAILY' ? (
             <>
               <button
                 onClick={handleExportDailyPdf}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 font-semibold transition-colors"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold transition-colors"
                 title="Télécharger le carnet de présence du jour en PDF officiel"
               >
                 <FileText className="w-3.5 h-3.5 text-rose-600" />
                 <span>PDF</span>
               </button>
 
-              <button
-                onClick={handleExportDailyExcel}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 font-semibold transition-colors"
-                title="Exporter les pointages du jour en Excel"
-              >
-                <Download className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Excel</span>
-              </button>
             </>
           ) : (
             <button
-              onClick={handleExportMonthlyExcel}
-              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 font-semibold shadow-xs transition-colors"
-              title="Exporter la feuille de synthèse mensuelle J1-J31 en Excel"
+              onClick={() => setExportingMonthly(true)}
+              disabled={exportingMonthly}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-rose-600 text-white hover:bg-rose-700 font-semibold shadow-xs transition-colors disabled:opacity-60"
+              title="Exporter la feuille de synthèse mensuelle J1-J31 en PDF, avec l'en-tête officiel PREMIDIS SARL"
             >
-              <Download className="w-3.5 h-3.5" />
-              <span>Exporter Grille Mensuelle Excel</span>
+              <FileText className="w-3.5 h-3.5" />
+              <span>{exportingMonthly ? 'Préparation du PDF…' : 'Exporter Grille Mensuelle PDF'}</span>
             </button>
           )}
         </div>
@@ -296,31 +263,31 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
         <div className="glass-card rounded-2xl p-5 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="font-bold text-sm text-[#1D2030] dark:text-white">
+              <span className="font-bold text-sm text-ink">
                 Pointages constatés le {new Date(selectedDate).toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
               </span>
-              <span className="text-xs px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 font-bold text-gray-600 dark:text-gray-400">
+              <span className="text-xs px-2 py-0.5 rounded-full bg-slate-100 font-bold text-slate-600">
                 {filteredDailyList.length} entrées
               </span>
             </div>
 
             {/* Legend for the 3 strict statuses */}
             <div className="hidden md:flex items-center gap-4 text-xs">
-              <span className="flex items-center gap-1 text-emerald-700 dark:text-emerald-400 font-semibold">
+              <span className="flex items-center gap-1 text-emerald-700 font-semibold">
                 <span className="w-2 h-2 rounded-full bg-emerald-500"></span> Présent (P)
               </span>
-              <span className="flex items-center gap-1 text-amber-700 dark:text-amber-400 font-semibold">
+              <span className="flex items-center gap-1 text-amber-700 font-semibold">
                 <span className="w-2 h-2 rounded-full bg-amber-500"></span> Retard (R)
               </span>
-              <span className="flex items-center gap-1 text-rose-700 dark:text-rose-400 font-semibold">
+              <span className="flex items-center gap-1 text-rose-700 font-semibold">
                 <span className="w-2 h-2 rounded-full bg-rose-500"></span> Absent (A)
               </span>
             </div>
           </div>
 
-          <div className="overflow-x-auto rounded-xl border border-gray-100 dark:border-gray-800">
+          <div className="overflow-x-auto rounded-xl border border-slate-100">
             <table className="w-full text-left text-xs">
-              <thead className="bg-gray-50/80 dark:bg-gray-800/50 text-[#717787] dark:text-gray-400 font-bold border-b border-gray-100 dark:border-gray-800">
+              <thead className="bg-slate-50/80 text-muted font-bold border-b border-slate-100">
                 <tr>
                   <th className="py-3 px-3">Matricule</th>
                   <th className="py-3 px-3">Nom & Postnom</th>
@@ -335,58 +302,58 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                   <th className="py-3 px-3 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-gray-800/60 font-medium">
+              <tbody className="divide-y divide-slate-100 font-medium">
                 {filteredDailyList.length === 0 ? (
                   <tr>
-                    <td colSpan={11} className="py-12 text-center text-gray-400">
+                    <td colSpan={11} className="py-12 text-center text-slate-400">
                       Aucun pointage trouvé pour cette date.
                     </td>
                   </tr>
                 ) : (
                   filteredDailyList.map((record) => (
-                    <tr key={record.id} className="hover:bg-gray-50/60 dark:hover:bg-gray-800/30 transition-colors">
-                      <td className="py-3 px-3 font-mono font-bold text-[#7C4DFF]">
+                    <tr key={record.id} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="py-3 px-3 font-mono font-bold text-brand">
                         {record.employeeId}
                       </td>
 
-                      <td className="py-3 px-3 font-bold text-[#1D2030] dark:text-white">
-                        {record.employeeName}
+                      <td className="py-3 px-3 font-bold text-ink">
+                        <span className="flex items-center gap-2"><EmployeeAvatar matricule={record.employeeId} name={record.employeeName} size={32} />{record.employeeName}</span>
                       </td>
 
-                      <td className="py-3 px-3 text-gray-600 dark:text-gray-400">
+                      <td className="py-3 px-3 text-slate-600">
                         {record.department}
                       </td>
 
-                      <td className="py-3 px-3 text-center font-mono text-gray-500">
+                      <td className="py-3 px-3 text-center font-mono text-slate-500">
                         {record.expectedCheckIn}
                       </td>
 
                       <td className="py-3 px-3 text-center font-mono font-bold">
                         {record.actualCheckIn ? (
-                          <span className={record.status === 'RETARD' ? 'text-amber-600' : 'text-gray-900 dark:text-white'}>
+                          <span className={record.status === 'RETARD' ? 'text-amber-600' : 'text-slate-900'}>
                             {record.actualCheckIn}
                           </span>
                         ) : (
-                          <span className="text-gray-300 dark:text-gray-600">–</span>
+                          <span className="text-slate-300">–</span>
                         )}
                       </td>
 
                       <td className="py-3 px-3 text-center font-mono">
                         {record.lateMinutes > 0 ? (
-                          <span className="font-bold text-amber-600 bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded">
+                          <span className="font-bold text-amber-600 bg-amber-50 px-2 py-0.5 rounded">
                             +{record.lateMinutes} min
                           </span>
                         ) : (
-                          <span className="text-gray-400">0 min</span>
+                          <span className="text-slate-400">0 min</span>
                         )}
                       </td>
 
-                      <td className="py-3 px-3 text-center font-mono text-gray-500">
+                      <td className="py-3 px-3 text-center font-mono text-slate-500">
                         {record.expectedCheckOut}
                       </td>
 
                       <td className="py-3 px-3 text-center font-mono">
-                        {record.actualCheckOut || <span className="text-gray-300 dark:text-gray-600">–</span>}
+                        {record.actualCheckOut || <span className="text-slate-300">–</span>}
                       </td>
 
                       {/* STRICT 3-STATUS BADGE */}
@@ -394,18 +361,18 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                         <StatusBadge status={record.status} size="sm" />
                       </td>
 
-                      <td className="py-3 px-3 text-gray-500 text-[11px]">
+                      <td className="py-3 px-3 text-slate-500 text-[11px]">
                         <div>
-                          <span className="font-semibold text-gray-700 dark:text-gray-300">
-                            {record.source === 'ZKTECO_BIOMETRIC' ? 'Biométrie' : 'Manuel'}
+                          <span className="font-semibold text-slate-700">
+                            {record.source === 'ZKTECO_BIOMETRIC' ? 'Biométrie' : record.source === 'FILE_IMPORT' ? 'Clé USB' : 'Manuel'}
                           </span>
                           {record.isCorrected && (
-                            <span className="block text-amber-600 dark:text-amber-400 font-medium">
+                            <span className="block text-amber-600 font-medium">
                               Corrigé : {record.correctionReason}
                             </span>
                           )}
                           {record.notes && !record.isCorrected && (
-                            <span className="block text-gray-400 truncate max-w-[120px]">
+                            <span className="block text-slate-400 truncate max-w-[120px]">
                               {record.notes}
                             </span>
                           )}
@@ -413,12 +380,12 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                       </td>
 
                       <td className="py-3 px-3 text-right">
-                        <button
+                        {canEdit && <button
                           onClick={() => onOpenCorrectModal(record)}
-                          className="px-2 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 font-semibold transition-colors text-[11px]"
+                          className="px-2 py-1 rounded-lg hover:bg-slate-100 text-slate-600 font-semibold transition-colors text-[11px]"
                         >
                           Modifier
-                        </button>
+                        </button>}
                       </td>
                     </tr>
                   ))
@@ -432,12 +399,12 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
       {/* VIEW 2: SYNTHÈSE MENSUELLE CARNET J1-J31 (EXACT REPLICA OF PREMIDIS EXCEL LOGBOOK) */}
       {activeTab === 'MONTHLY_GRID' && (
         <div className="glass-card rounded-2xl p-5 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-gray-100 dark:border-gray-800">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
             <div>
-              <h3 className="text-base font-bold text-[#1D2030] dark:text-white">
-                Carnet de Synthèse Mensuelle des Présences (J1 à J31)
+              <h3 className="text-base font-bold text-ink">
+                Carnet de Synthèse Mensuelle des Présences (J1 à J{monthDays.length})
               </h3>
-              <p className="text-xs text-gray-500">
+              <p className="text-xs text-slate-500">
                 Mois sélectionné : {selectedMonth} · Codes réglementaires : P = Présent (vert), R = Retard (orange), A = Absent (rouge)
               </p>
             </div>
@@ -450,58 +417,58 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
           </div>
 
           {/* Grid table */}
-          <div className="overflow-x-auto rounded-xl border border-gray-200 dark:border-gray-800">
+          <div className="overflow-x-auto rounded-xl border border-slate-200">
             <table className="w-full text-left text-[11px] border-collapse">
               <thead className="bg-[#14233B] text-white font-bold">
                 <tr>
-                  <th className="py-2.5 px-2 text-center border-r border-gray-700 w-8">N°</th>
-                  <th className="py-2.5 px-3 border-r border-gray-700 min-w-[65px]">Matricule</th>
-                  <th className="py-2.5 px-3 border-r border-gray-700 min-w-[150px]">Nom & Postnom</th>
-                  <th className="py-2.5 px-3 border-r border-gray-700 min-w-[120px]">Département</th>
+                  <th className="py-2.5 px-2 text-center border-r border-slate-700 w-8">N°</th>
+                  <th className="py-2.5 px-3 border-r border-slate-700 min-w-[65px]">Matricule</th>
+                  <th className="py-2.5 px-3 border-r border-slate-700 min-w-[150px]">Nom & Postnom</th>
+                  <th className="py-2.5 px-3 border-r border-slate-700 min-w-[120px]">Département</th>
                   
-                  {/* Days 1 to 31 */}
-                  {Array.from({ length: 31 }, (_, i) => i + 1).map(day => (
-                    <th key={day} className="py-2 px-1 text-center border-r border-gray-700 min-w-[24px]">
+                  {/* Jours du mois */}
+                  {monthDays.map(day => (
+                    <th key={day} className="py-2 px-1 text-center border-r border-slate-700 min-w-[24px]">
                       {day}
                     </th>
                   ))}
 
                   {/* Monthly Summary Totals */}
-                  <th className="py-2.5 px-2 text-center bg-emerald-900/60 border-r border-gray-700 text-emerald-200 min-w-[32px]" title="Total Présents">P</th>
-                  <th className="py-2.5 px-2 text-center bg-amber-900/60 border-r border-gray-700 text-amber-200 min-w-[32px]" title="Total Retards">R</th>
-                  <th className="py-2.5 px-2 text-center bg-rose-900/60 border-r border-gray-700 text-rose-200 min-w-[32px]" title="Total Absents">A</th>
-                  <th className="py-2.5 px-2 text-center bg-gray-800 text-white min-w-[45px]" title="Retard cumulé en minutes">Min.</th>
+                  <th className="py-2.5 px-2 text-center bg-emerald-900/60 border-r border-slate-700 text-emerald-200 min-w-[32px]" title="Total Présents">P</th>
+                  <th className="py-2.5 px-2 text-center bg-amber-900/60 border-r border-slate-700 text-amber-200 min-w-[32px]" title="Total Retards">R</th>
+                  <th className="py-2.5 px-2 text-center bg-rose-900/60 border-r border-slate-700 text-rose-200 min-w-[32px]" title="Total Absents">A</th>
+                  <th className="py-2.5 px-2 text-center bg-slate-800 text-white min-w-[45px]" title="Retard cumulé en minutes">Min.</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-gray-200 dark:divide-gray-800 font-medium">
+              <tbody className="divide-y divide-slate-200 font-medium">
                 {monthlySynthesis.length === 0 ? (
                   <tr>
-                    <td colSpan={39} className="py-12 text-center text-gray-400">
+                    <td colSpan={monthDays.length + 8} className="py-12 text-center text-slate-400">
                       Aucun employé trouvé pour cette sélection.
                     </td>
                   </tr>
                 ) : (
                   monthlySynthesis.map((row) => (
-                    <tr key={row.employee.id} className="hover:bg-gray-50/80 dark:hover:bg-gray-800/40">
-                      <td className="py-2 px-2 text-center font-mono text-gray-400 border-r border-gray-200 dark:border-gray-800">
+                    <tr key={row.employee.id} className="hover:bg-slate-50/80">
+                      <td className="py-2 px-2 text-center font-mono text-slate-400 border-r border-slate-200">
                         {row.number}
                       </td>
-                      <td className="py-2 px-3 font-mono font-bold text-[#7C4DFF] border-r border-gray-200 dark:border-gray-800">
+                      <td className="py-2 px-3 font-mono font-bold text-brand border-r border-slate-200">
                         {row.employee.matricule}
                       </td>
-                      <td className="py-2 px-3 font-bold text-gray-900 dark:text-white border-r border-gray-200 dark:border-gray-800 truncate max-w-[150px]">
-                        {row.employee.nom} {row.employee.postnom} {row.employee.prenom}
+                      <td className="py-2 px-3 font-bold text-slate-900 border-r border-slate-200 max-w-[190px]">
+                        <span className="flex items-center gap-2 min-w-0"><EmployeeAvatar name={row.employee.nom} photoUrl={row.employee.photoUrl || ''} size={24} /><span className="truncate">{row.employee.nom} {row.employee.postnom} {row.employee.prenom}</span></span>
                       </td>
-                      <td className="py-2 px-3 text-gray-600 dark:text-gray-400 border-r border-gray-200 dark:border-gray-800 truncate max-w-[120px]">
+                      <td className="py-2 px-3 text-slate-600 border-r border-slate-200 truncate max-w-[120px]">
                         {row.employee.departement}
                       </td>
 
-                      {/* Day cells 1 to 31 */}
-                      {Array.from({ length: 31 }, (_, i) => i + 1).map(day => {
+                      {/* Une cellule par jour du mois */}
+                      {monthDays.map(day => {
                         const rec = row.days[day];
                         if (!rec) {
                           return (
-                            <td key={day} className="py-1 px-1 text-center border-r border-gray-200 dark:border-gray-800 text-gray-300 dark:text-gray-700">
+                            <td key={day} className="py-1 px-1 text-center border-r border-slate-200 text-slate-300">
                               ·
                             </td>
                           );
@@ -521,7 +488,7 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                         return (
                           <td 
                             key={day} 
-                            className="py-1 px-1 text-center border-r border-gray-200 dark:border-gray-800"
+                            className="py-1 px-1 text-center border-r border-slate-200"
                             title={`J${day} : ${rec.status} (${rec.actualCheckIn || 'Non pointé'})`}
                           >
                             <span className={`inline-block w-5 h-5 leading-5 rounded text-[10px] font-bold ${bg}`}>
@@ -532,16 +499,16 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
                       })}
 
                       {/* Totals */}
-                      <td className="py-2 px-2 text-center font-bold text-emerald-700 bg-emerald-50 dark:bg-emerald-950/20 border-r border-gray-200 dark:border-gray-800">
+                      <td className="py-2 px-2 text-center font-bold text-emerald-700 bg-emerald-50 border-r border-slate-200">
                         {row.totalP}
                       </td>
-                      <td className="py-2 px-2 text-center font-bold text-amber-700 bg-amber-50 dark:bg-amber-950/20 border-r border-gray-200 dark:border-gray-800">
+                      <td className="py-2 px-2 text-center font-bold text-amber-700 bg-amber-50 border-r border-slate-200">
                         {row.totalR}
                       </td>
-                      <td className="py-2 px-2 text-center font-bold text-rose-700 bg-rose-50 dark:bg-rose-950/20 border-r border-gray-200 dark:border-gray-800">
+                      <td className="py-2 px-2 text-center font-bold text-rose-700 bg-rose-50 border-r border-slate-200">
                         {row.totalA}
                       </td>
-                      <td className="py-2 px-2 text-center font-mono font-bold text-gray-900 dark:text-white bg-gray-50 dark:bg-gray-800/60">
+                      <td className="py-2 px-2 text-center font-mono font-bold text-slate-900 bg-slate-50">
                         {row.totalLateMin}m
                       </td>
                     </tr>
@@ -550,6 +517,14 @@ export const AttendanceView: React.FC<AttendanceViewProps> = ({
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+      {exportingMonthly && (
+        <div aria-hidden style={{ position: 'fixed', left: -20000, top: 0, width: 1280, pointerEvents: 'none' }}>
+          <ReportsView
+            preset={{ period: 'MOIS', month: selectedMonth, department: selectedDepartment, status: selectedStatus }}
+            onDocumentReady={handleMonthlyDocumentReady}
+          />
         </div>
       )}
     </div>

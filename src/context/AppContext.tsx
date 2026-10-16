@@ -2,37 +2,57 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { 
   User, Employee, Department, AttendanceRecord, AttendanceStatus, 
   ZKTecoDeviceConfig, SanctionRule, SanctionCase, AuditLog, CompanySettings,
-  SyncLogEntry, SanctionStatus
+  SyncLogEntry, AppModule, PermissionAction, RoleDefinition
 } from '../types';
+import { normalizeSanctionLevel } from '../types';
+import { INITIAL_ROLES } from '../data/permissions';
+import { absentCandidates, type DayAttendance } from '../utils/attendanceReader';
+import { caseMonth, type SanctionProposal } from '../utils/sanctions';
+import { useTheme, setThemeUser } from '../theme/theme';
+import { loadJSON, saveJSON, onStorageIssue, type StorageIssue } from '../utils/storage';
 import { 
   INITIAL_COMPANY_SETTINGS, INITIAL_USERS, INITIAL_DEPARTMENTS, 
   INITIAL_EMPLOYEES, generateMockAttendance, INITIAL_SANCTION_RULES, 
   INITIAL_SANCTION_CASES, INITIAL_ZKTECO_CONFIG, INITIAL_AUDIT_LOGS 
 } from '../data/mockData';
 
-export type AppView = 'dashboard' | 'employees' | 'attendance' | 'reports' | 'sanctions' | 'settings';
-export type AppLanguage = 'fr' | 'en';
+export type AppView = AppModule;
 
 interface AppContextType {
   // Appearance & Session
   theme: 'light' | 'dark';
-  setTheme: (theme: 'light' | 'dark') => void;
-  toggleTheme: () => void;
-  language: AppLanguage;
-  setLanguage: (lang: AppLanguage) => void;
   currentView: AppView;
   setCurrentView: (view: AppView) => void;
+  /** Carnet de présence d'un agent ouvert depuis le tableau de bord (matricule), sinon null */
+  carnetEmployee: string | null;
+  openEmployeeCarnet: (matricule: string | null) => void;
+  /** Onglet ouvert à l'arrivée dans Rapports (le menu ouvre le relevé des présences) */
+  reportTab: 'ATTENDANCE' | 'SANCTIONS';
+  openReport: (tab: 'ATTENDANCE' | 'SANCTIONS', month?: string) => void;
+  /** Mois proposé à l'arrivée dans Rapports (AAAA-MM) */
+  reportMonth: string | null;
   currentUser: User | null;
   setCurrentUser: (user: User | null) => void;
-  switchUserRole: (role: User['role']) => void;
   allUsers: User[];
+  addUser: (user: Omit<User, 'id'>) => void;
+  updateUser: (id: string, user: Partial<User>) => void;
+  deleteUser: (id: string) => void;
+
+  // Rôles & permissions
+  roles: RoleDefinition[];
+  addRole: (role: Omit<RoleDefinition, 'id' | 'system'>) => void;
+  updateRole: (id: string, role: Partial<Omit<RoleDefinition, 'id' | 'system'>>) => void;
+  deleteRole: (id: string) => void;
+  getRoleLabel: (roleId: string) => string;
+  can: (module: AppModule, action?: PermissionAction) => boolean;
+  /** Écran accessible : Paramètres s'ouvre aussi pour l'import du matin (droit « Présences › Créer ») */
+  canOpen: (view: AppModule) => boolean;
   
   // Data entities
   companySettings: CompanySettings;
   updateCompanySettings: (settings: Partial<CompanySettings>) => void;
   departments: Department[];
   addDepartment: (dep: Omit<Department, 'id'>) => void;
-  updateDepartment: (id: string, dep: Partial<Department>) => void;
   
   employees: Employee[];
   addEmployee: (emp: Omit<Employee, 'id'>) => void;
@@ -40,16 +60,15 @@ interface AppContextType {
   deleteEmployee: (id: string) => void;
 
   attendanceRecords: AttendanceRecord[];
-  recordPunch: (matricule: string, time: string, isCheckOut?: boolean, notes?: string) => void;
   correctAttendance: (recordId: string, newCheckIn: string | null, newCheckOut: string | null, reason: string) => void;
-  bulkImportAttendance: (records: AttendanceRecord[], sourceMessage: string) => { added: number; updated: number };
   
   // ZKTeco integration
   zktecoConfig: ZKTecoDeviceConfig;
   updateZKTecoConfig: (config: Partial<ZKTecoDeviceConfig>) => void;
-  testZKTecoConnection: () => Promise<{ success: boolean; message: string; latencyMs: number }>;
-  syncZKTecoNow: () => Promise<{ success: boolean; punchesImported: number; message: string }>;
-  importZKTecoFile: (fileName: string, fileContent: string) => Promise<{ success: boolean; count: number; errors: string[] }>;
+  /** Importe des journées déjà lues et vérifiées (aperçu de l'import) */
+  applyAttendanceImport: (fileName: string, days: DayAttendance[], warnings?: string[], markAbsents?: boolean) => { count: number; absents: number; dates: string[] };
+  /** Jour affiché par défaut : le dernier jour importé depuis la pointeuse */
+  workingDate: string;
 
   // Sanctions
   sanctionRules: SanctionRule[];
@@ -57,142 +76,237 @@ interface AppContextType {
   updateSanctionRule: (id: string, rule: Partial<SanctionRule>) => void;
   deleteSanctionRule: (id: string) => void;
   sanctionCases: SanctionCase[];
-  reviewSanctionCase: (id: string, status: SanctionStatus, motif: string, approvedAmount?: number) => void;
+  /** Décision de la Direction sur un dossier proposé (validé ou rejeté), avec motif */
+  decideSanction: (proposal: SanctionProposal, status: 'APPROUVEE' | 'REJETEE', motif: string) => void;
   
   // Audit Logs
   auditLogs: AuditLog[];
   addAuditLog: (action: string, target: string, details: string) => void;
 
+  // Incidents de stockage
+  storageIssues: StorageIssue[];
+  dismissStorageIssues: () => void;
+
   // Calculation helpers
   calculateStatus: (expectedIn: string, actualIn: string | null, toleranceMin: number) => { status: AttendanceStatus; lateMinutes: number };
-  t: (key: string) => string;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
+const AUDIT_LOG_LIMIT = 2000;
+
+/** Dernier jour présent dans le carnet (jour affiché par défaut à l'ouverture) */
+function lastRecordDate(records: AttendanceRecord[]): string {
+  const dates = records.map(r => r.date).filter(Boolean).sort();
+  return dates[dates.length - 1] || new Date().toISOString().slice(0, 10);
+}
+
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Theme State
-  const [theme, setThemeState] = useState<'light' | 'dark'>(() => {
-    const saved = localStorage.getItem('premidis_theme');
-    return (saved === 'dark' || saved === 'light') ? saved : 'light';
-  });
+  // Thème clair / sombre : même moteur que PREMIDIS ERP (attribut data-theme, préférence par utilisateur)
+  const { theme } = useTheme();
 
-  const setTheme = (newTheme: 'light' | 'dark') => {
-    setThemeState(newTheme);
-    localStorage.setItem('premidis_theme', newTheme);
-    if (newTheme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  };
-
-  const toggleTheme = () => {
-    setTheme(theme === 'light' ? 'dark' : 'light');
-  };
-
-  useEffect(() => {
-    if (theme === 'dark') {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  }, [theme]);
-
-  // 2. Language State
-  const [language, setLanguageState] = useState<AppLanguage>(() => {
-    const saved = localStorage.getItem('premidis_lang');
-    return saved === 'en' ? 'en' : 'fr';
-  });
-
-  const setLanguage = (lang: AppLanguage) => {
-    setLanguageState(lang);
-    localStorage.setItem('premidis_lang', lang);
-  };
+  // Incidents de stockage (donnée illisible mise de côté, stockage plein) affichés à l'utilisateur
+  const [storageIssues, setStorageIssues] = useState<StorageIssue[]>([]);
+  useEffect(() => onStorageIssue(issue => setStorageIssues(prev =>
+    prev.some(p => p.kind === issue.kind && p.key === issue.key) ? prev : [...prev, issue])), []);
+  const dismissStorageIssues = () => setStorageIssues([]);
 
   // 3. User & Navigation
-  const [currentUser, setCurrentUser] = useState<User | null>(INITIAL_USERS[0]); // default admin
+  const [allUsers, setAllUsers] = useState<User[]>(() => {
+    return loadJSON('premidis_users', () => INITIAL_USERS.map(u => ({ ...u, active: true })));
+  });
+  const [roles, setRoles] = useState<RoleDefinition[]>(() => {
+    return loadJSON('premidis_roles', () => INITIAL_ROLES);
+  });
+  // Aucune session gardée : à chaque ouverture, l'introduction puis la page de connexion
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [currentView, setCurrentView] = useState<AppView>('dashboard');
-  const allUsers = INITIAL_USERS;
+  const [carnetEmployee, setCarnetEmployee] = useState<string | null>(null);
+  const openEmployeeCarnet = (matricule: string | null) => {
+    setCarnetEmployee(matricule);
+    if (matricule) setCurrentView('attendance');
+  };
+  const [reportTab, setReportTab] = useState<'ATTENDANCE' | 'SANCTIONS'>('ATTENDANCE');
+  const [reportMonth, setReportMonth] = useState<string | null>(null);
+  const openReport = (tab: 'ATTENDANCE' | 'SANCTIONS', month?: string) => {
+    setCarnetEmployee(null);
+    setReportTab(tab);
+    setReportMonth(month ?? null);
+    setCurrentView('reports');
+  };
+  // Changer d'écran depuis le menu referme le carnet individuel et rouvre les rapports sur les présences
+  const goToView = (view: AppView) => { setCarnetEmployee(null); setReportTab('ATTENDANCE'); setReportMonth(null); setCurrentView(view); };
 
-  const switchUserRole = (role: User['role']) => {
-    const target = INITIAL_USERS.find(u => u.role === role) || INITIAL_USERS[0];
-    setCurrentUser(target);
-    addAuditLog('CHANGEMENT_UTILISATEUR', target.name, `Connecté sous le profil ${target.role}`);
+  useEffect(() => {
+    saveJSON('premidis_users', allUsers);
+  }, [allUsers]);
+  useEffect(() => {
+    saveJSON('premidis_roles', roles);
+  }, [roles]);
+
+  useEffect(() => {
+    setThemeUser(currentUser?.id || null);
+  }, [currentUser?.id]);
+
+  // Un compte désactivé ou supprimé pendant la session est déconnecté immédiatement
+  useEffect(() => {
+    if (!currentUser) return;
+    const account = allUsers.find(u => u.id === currentUser.id);
+    if (!account || account.active === false) setCurrentUser(null);
+  }, [allUsers, currentUser]);
+
+  const getRoleLabel = (roleId: string) => roles.find(r => r.id === roleId)?.label || roleId;
+
+  const can = (module: AppModule, action: PermissionAction = 'view') => {
+    if (!currentUser) return false;
+    const role = roles.find(r => r.id === currentUser.role);
+    return !!role?.permissions[module]?.includes(action);
+  };
+  const canOpen = (view: AppModule) => can(view) || (view === 'settings' && can('attendance', 'create'));
+
+  /**
+   * Contrôle de droit appliqué à chaque modification, en plus des boutons masqués à l'écran :
+   * une action non autorisée est refusée et inscrite au journal d'audit.
+   */
+  const allowed = (module: AppModule, action: PermissionAction, operation: string) => {
+    if (can(module, action)) return true;
+    addAuditLog('ACTION_REFUSEE', operation, `Droit « ${action} » manquant sur le module ${module}`);
+    return false;
+  };
+
+  const addUser = (user: Omit<User, 'id'>) => {
+    if (!allowed('settings', 'edit', 'addUser')) return;
+    const newUser: User = { ...user, id: `usr-${Date.now()}`, active: user.active ?? true };
+    setAllUsers(prev => [...prev, newUser]);
+    addAuditLog('CREATION_UTILISATEUR', newUser.email, `Rôle : ${getRoleLabel(newUser.role)}`);
+  };
+
+  const updateUser = (id: string, data: Partial<User>) => {
+    if (!allowed('settings', 'edit', 'updateUser')) return;
+    setAllUsers(prev => prev.map(u => (u.id === id ? { ...u, ...data } : u)));
+    if (currentUser?.id === id) setCurrentUser(prev => (prev ? { ...prev, ...data } : prev));
+    const target = allUsers.find(u => u.id === id);
+    const details = data.role ? `Nouveau rôle : ${getRoleLabel(data.role)}`
+      : data.active !== undefined ? (data.active ? 'Compte activé' : 'Compte désactivé')
+      : 'Mise à jour du compte';
+    addAuditLog('MODIFICATION_UTILISATEUR', target?.email || id, details);
+  };
+
+  const deleteUser = (id: string) => {
+    if (!allowed('settings', 'edit', 'deleteUser')) return;
+    if (currentUser?.id === id) return; // on ne supprime pas son propre compte
+    const target = allUsers.find(u => u.id === id);
+    setAllUsers(prev => prev.filter(u => u.id !== id));
+    addAuditLog('SUPPRESSION_UTILISATEUR', target?.email || id, 'Compte supprimé');
+  };
+
+  const addRole = (role: Omit<RoleDefinition, 'id' | 'system'>) => {
+    if (!allowed('settings', 'edit', 'addRole')) return;
+    const base = role.label.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_|_$/g, '') || 'ROLE';
+    let id = base;
+    for (let i = 2; roles.some(r => r.id === id); i++) id = `${base}_${i}`;
+    setRoles(prev => [...prev, { ...role, id }]);
+    addAuditLog('CREATION_ROLE', role.label, role.description || 'Nouveau rôle');
+  };
+
+  const updateRole = (id: string, data: Partial<Omit<RoleDefinition, 'id' | 'system'>>) => {
+    if (!allowed('settings', 'edit', 'updateRole')) return;
+    if (id === 'ADMIN' && data.permissions) return; // l'administrateur garde tous les droits
+    setRoles(prev => prev.map(r => (r.id === id ? { ...r, ...data } : r)));
+    addAuditLog('MODIFICATION_ROLE', getRoleLabel(id), data.permissions ? 'Permissions mises à jour' : 'Rôle mis à jour');
+  };
+
+  const deleteRole = (id: string) => {
+    if (!allowed('settings', 'edit', 'deleteRole')) return;
+    const role = roles.find(r => r.id === id);
+    if (!role || role.system || allUsers.some(u => u.role === id)) return;
+    setRoles(prev => prev.filter(r => r.id !== id));
+    addAuditLog('SUPPRESSION_ROLE', role.label, 'Rôle supprimé');
   };
 
   // 4. Data states with localStorage persistence
   const [companySettings, setCompanySettings] = useState<CompanySettings>(() => {
-    const saved = localStorage.getItem('premidis_settings');
-    return saved ? JSON.parse(saved) : INITIAL_COMPANY_SETTINGS;
+    return loadJSON('premidis_settings', () => INITIAL_COMPANY_SETTINGS);
   });
 
   const [departments, setDepartments] = useState<Department[]>(() => {
-    const saved = localStorage.getItem('premidis_departments');
-    return saved ? JSON.parse(saved) : INITIAL_DEPARTMENTS;
+    return loadJSON('premidis_departments', () => INITIAL_DEPARTMENTS, () => []);
   });
 
   const [employees, setEmployees] = useState<Employee[]>(() => {
-    const saved = localStorage.getItem('premidis_employees');
-    return saved ? JSON.parse(saved) : INITIAL_EMPLOYEES;
+    return loadJSON('premidis_employees', () => INITIAL_EMPLOYEES, () => []);
   });
 
+  const [workingDate, setWorkingDate] = useState<string>(() => {
+    return loadJSON<string>('premidis_working_date', () => lastRecordDate(loadJSON<AttendanceRecord[]>('premidis_attendance', generateMockAttendance)));
+  });
+  useEffect(() => { saveJSON('premidis_working_date', workingDate); }, [workingDate]);
+
   const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>(() => {
-    const saved = localStorage.getItem('premidis_attendance');
-    return saved ? JSON.parse(saved) : generateMockAttendance();
+    const saved = loadJSON<unknown[] | null>('premidis_attendance', () => null, () => []);
+    if (!saved) return generateMockAttendance();
+    // Anciennes données de démonstration : « 08:-4 » corrigé en « 07:56 »
+    const fix = (t: string | null) => {
+      const m = t?.match(/^(\d{2}):(-\d+)$/);
+      if (!m) return t;
+      const total = Number(m[1]) * 60 + Number(m[2]);
+      return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+    };
+    return (saved as AttendanceRecord[]).map(r => ({ ...r, actualCheckIn: fix(r.actualCheckIn), actualCheckOut: fix(r.actualCheckOut) }));
   });
 
   const [zktecoConfig, setZKTecoConfig] = useState<ZKTecoDeviceConfig>(() => {
-    const saved = localStorage.getItem('premidis_zkteco');
-    return saved ? JSON.parse(saved) : INITIAL_ZKTECO_CONFIG;
+    return loadJSON('premidis_zkteco', () => INITIAL_ZKTECO_CONFIG);
   });
 
   const [sanctionRules, setSanctionRules] = useState<SanctionRule[]>(() => {
-    const saved = localStorage.getItem('premidis_sanction_rules');
-    return saved ? JSON.parse(saved) : INITIAL_SANCTION_RULES;
+    const saved = loadJSON<unknown[] | null>('premidis_sanction_rules', () => null, () => []);
+    if (!saved) return INITIAL_SANCTION_RULES;
+    return (saved as SanctionRule[]).map(r => ({ ...r, sanctionType: normalizeSanctionLevel(r.sanctionType, r.deductionAmount) }));
   });
 
   const [sanctionCases, setSanctionCases] = useState<SanctionCase[]>(() => {
-    const saved = localStorage.getItem('premidis_sanction_cases');
-    return saved ? JSON.parse(saved) : INITIAL_SANCTION_CASES;
+    const saved = loadJSON<unknown[] | null>('premidis_sanction_cases', () => null, () => []);
+    if (!saved) return INITIAL_SANCTION_CASES;
+    return (saved as SanctionCase[]).map(c => ({ ...c, proposedSanction: normalizeSanctionLevel(c.proposedSanction, c.deductionAmount) }));
   });
 
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() => {
-    const saved = localStorage.getItem('premidis_audit_logs');
-    return saved ? JSON.parse(saved) : INITIAL_AUDIT_LOGS;
+    return loadJSON('premidis_audit_logs', () => INITIAL_AUDIT_LOGS, () => []);
   });
 
   // Save to localStorage when updated
   useEffect(() => {
-    localStorage.setItem('premidis_settings', JSON.stringify(companySettings));
+    saveJSON('premidis_settings', companySettings);
   }, [companySettings]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_departments', JSON.stringify(departments));
+    saveJSON('premidis_departments', departments);
   }, [departments]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_employees', JSON.stringify(employees));
+    saveJSON('premidis_employees', employees);
   }, [employees]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_attendance', JSON.stringify(attendanceRecords));
+    saveJSON('premidis_attendance', attendanceRecords);
   }, [attendanceRecords]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_zkteco', JSON.stringify(zktecoConfig));
+    saveJSON('premidis_zkteco', zktecoConfig);
   }, [zktecoConfig]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_sanction_rules', JSON.stringify(sanctionRules));
+    saveJSON('premidis_sanction_rules', sanctionRules);
   }, [sanctionRules]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_sanction_cases', JSON.stringify(sanctionCases));
+    saveJSON('premidis_sanction_cases', sanctionCases);
   }, [sanctionCases]);
 
   useEffect(() => {
-    localStorage.setItem('premidis_audit_logs', JSON.stringify(auditLogs));
+    saveJSON('premidis_audit_logs', auditLogs);
   }, [auditLogs]);
 
   // Audit Log Helper
@@ -202,12 +316,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
       userId: currentUser?.id || 'sys',
       userName: currentUser?.name || 'Système',
-      userRole: currentUser?.role || 'ADMIN',
+      userRole: currentUser?.role || 'SYSTEME',
       action,
       target,
       details
     };
-    setAuditLogs(prev => [newLog, ...prev]);
+    // Les 2 000 derniers événements sont conservés (le journal ne remplit pas le stockage)
+    setAuditLogs(prev => [newLog, ...prev].slice(0, AUDIT_LOG_LIMIT));
   };
 
   // Status Calculation Helper (STRICT 3-STATUS RULE)
@@ -232,6 +347,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Employee Actions
   const addEmployee = (empData: Omit<Employee, 'id'>) => {
+    if (!allowed('employees', 'create', 'addEmployee')) return;
     const newEmp: Employee = {
       ...empData,
       id: `emp-${Date.now()}`
@@ -241,12 +357,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateEmployee = (id: string, empData: Partial<Employee>) => {
-    setEmployees(prev => prev.map(e => e.id === id ? { ...e, ...empData } : e));
+    if (!allowed('employees', 'edit', 'updateEmployee')) return;
     const emp = employees.find(e => e.id === id);
-    addAuditLog('MODIFICATION_EMPLOYE', emp ? emp.matricule : id, 'Mise à jour du dossier employé');
+    if (!emp) return;
+    const next = { ...emp, ...empData };
+    setEmployees(prev => prev.map(e => e.id === id ? next : e));
+    // Le carnet et les dossiers suivent le matricule, le nom et le département de l'employé
+    const fullName = `${next.nom} ${next.postnom} ${next.prenom}`;
+    if (next.matricule !== emp.matricule || fullName !== `${emp.nom} ${emp.postnom} ${emp.prenom}` || next.departement !== emp.departement) {
+      setAttendanceRecords(prev => prev.map(r => r.employeeId === emp.matricule
+        ? { ...r, employeeId: next.matricule, employeeName: fullName, department: next.departement, id: r.id.replace(emp.matricule, next.matricule) }
+        : r));
+      setSanctionCases(prev => prev.map(c => c.employeeId === emp.matricule || c.matricule === emp.matricule
+        ? { ...c, employeeId: next.matricule, matricule: next.matricule, employeeName: fullName, department: next.departement }
+        : c));
+    }
+    addAuditLog('MODIFICATION_EMPLOYE', next.matricule, emp.matricule !== next.matricule ? `Matricule ${emp.matricule} → ${next.matricule}` : 'Mise à jour du dossier employé');
   };
 
   const deleteEmployee = (id: string) => {
+    if (!allowed('employees', 'delete', 'deleteEmployee')) return;
     const emp = employees.find(e => e.id === id);
     if (emp) {
       setEmployees(prev => prev.filter(e => e.id !== id));
@@ -256,6 +386,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // Department Actions
   const addDepartment = (depData: Omit<Department, 'id'>) => {
+    if (!allowed('settings', 'create', 'addDepartment')) return;
     const newDep: Department = {
       ...depData,
       id: `dep-${Date.now()}`
@@ -264,74 +395,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     addAuditLog('CREATION_DEPARTEMENT', newDep.name, `Code: ${newDep.code}`);
   };
 
-  const updateDepartment = (id: string, depData: Partial<Department>) => {
-    setDepartments(prev => prev.map(d => d.id === id ? { ...d, ...depData } : d));
-  };
+
 
   // Attendance Actions
-  const recordPunch = (matricule: string, time: string, isCheckOut = false, notes = '') => {
-    const emp = employees.find(e => e.matricule === matricule);
-    if (!emp) return;
-
-    const todayStr = '2026-10-11'; // Current app date
-    const existingIndex = attendanceRecords.findIndex(r => r.employeeId === matricule && r.date === todayStr);
-
-    if (existingIndex >= 0) {
-      // Update existing record
-      const existing = attendanceRecords[existingIndex];
-      const updated = { ...existing };
-      
-      if (isCheckOut) {
-        updated.actualCheckOut = time;
-        updated.rawPunchOutTime = `${todayStr} ${time}:00`;
-        const [expOutH, expOutM] = updated.expectedCheckOut.split(':').map(Number);
-        const [actOutH, actOutM] = time.split(':').map(Number);
-        const earlyDiff = (expOutH * 60 + expOutM) - (actOutH * 60 + actOutM);
-        updated.earlyDepartureMinutes = earlyDiff > 0 ? earlyDiff : 0;
-      } else {
-        updated.actualCheckIn = time;
-        updated.rawPunchInTime = `${todayStr} ${time}:00`;
-        const { status, lateMinutes } = calculateStatus(emp.heureEntreeNormale, time, emp.toleranceMinutes);
-        updated.status = status;
-        updated.lateMinutes = lateMinutes;
-      }
-      if (notes) updated.notes = notes;
-
-      setAttendanceRecords(prev => {
-        const copy = [...prev];
-        copy[existingIndex] = updated;
-        return copy;
-      });
-
-      addAuditLog('POINTAGE_ENREGISTRE', `${matricule} (${emp.nom})`, `${isCheckOut ? 'Sortie' : 'Entrée'} à ${time}`);
-    } else {
-      // Create new record
-      const { status, lateMinutes } = calculateStatus(emp.heureEntreeNormale, isCheckOut ? null : time, emp.toleranceMinutes);
-      const newRec: AttendanceRecord = {
-        id: `att-${matricule}-${todayStr}`,
-        employeeId: matricule,
-        employeeName: `${emp.nom} ${emp.postnom} ${emp.prenom}`,
-        department: emp.departement,
-        date: todayStr,
-        expectedCheckIn: emp.heureEntreeNormale,
-        actualCheckIn: isCheckOut ? null : time,
-        lateMinutes: isCheckOut ? 0 : lateMinutes,
-        expectedCheckOut: emp.heureSortieNormale,
-        actualCheckOut: isCheckOut ? time : null,
-        earlyDepartureMinutes: 0,
-        status: isCheckOut ? 'PRESENT' : status,
-        source: 'MANUAL',
-        notes,
-        rawPunchInTime: isCheckOut ? null : `${todayStr} ${time}:00`,
-        rawPunchOutTime: isCheckOut ? `${todayStr} ${time}:00` : null,
-        verifiedByGuardOrSec: true
-      };
-      setAttendanceRecords(prev => [newRec, ...prev]);
-      addAuditLog('POINTAGE_MANUEL', `${matricule} (${emp.nom})`, `${isCheckOut ? 'Sortie' : 'Entrée'} à ${time}`);
-    }
-  };
-
   const correctAttendance = (recordId: string, newCheckIn: string | null, newCheckOut: string | null, reason: string) => {
+    if (!allowed('attendance', 'edit', 'correctAttendance')) return;
     const existing = attendanceRecords.find(r => r.id === recordId);
     if (!existing) return;
 
@@ -365,29 +433,36 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const bulkImportAttendance = (newRecords: AttendanceRecord[], sourceMessage: string) => {
-    let added = 0;
-    let updated = 0;
+    // Compte fait sur les données actuelles (et non dans la mise à jour différée de React)
+    const existing = new Set(attendanceRecords.map(r => `${r.employeeId}-${r.date}`));
+    const added = newRecords.filter(r => !existing.has(`${r.employeeId}-${r.date}`)).length;
+    const updated = newRecords.length - added;
 
     setAttendanceRecords(prev => {
       const map = new Map<string, AttendanceRecord>(prev.map(r => [`${r.employeeId}-${r.date}`, r]));
       newRecords.forEach(nr => {
         const key = `${nr.employeeId}-${nr.date}`;
         if (map.has(key)) {
-          // Merge punch details
           const cur = map.get(key)!;
-          map.set(key, {
-            ...cur,
-            actualCheckIn: nr.actualCheckIn || cur.actualCheckIn,
-            actualCheckOut: nr.actualCheckOut || cur.actualCheckOut,
-            status: nr.status,
-            lateMinutes: nr.lateMinutes,
-            rawPunchInTime: nr.rawPunchInTime || cur.rawPunchInTime,
-            rawPunchOutTime: nr.rawPunchOutTime || cur.rawPunchOutTime
-          });
-          updated++;
+          if (cur.isCorrected) {
+            // Une correction manuelle validée reste prioritaire sur le fichier de la pointeuse
+            map.set(key, { ...cur, notes: `${cur.notes || ''} · Pointeuse : ${nr.rawPunchInTime || ''}`.replace(/^ · /, '') });
+          } else {
+            map.set(key, {
+              ...cur,
+              actualCheckIn: nr.actualCheckIn || cur.actualCheckIn,
+              actualCheckOut: nr.actualCheckOut || cur.actualCheckOut,
+              earlyDepartureMinutes: nr.earlyDepartureMinutes,
+              status: nr.status,
+              lateMinutes: nr.lateMinutes,
+              source: nr.source,
+              notes: nr.notes,
+              rawPunchInTime: nr.rawPunchInTime || cur.rawPunchInTime,
+              rawPunchOutTime: nr.rawPunchOutTime || cur.rawPunchOutTime
+            });
+          }
         } else {
           map.set(key, nr);
-          added++;
         }
       });
       return Array.from(map.values());
@@ -399,169 +474,89 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // ZKTeco Device Actions
   const updateCompanySettings = (newSettings: Partial<CompanySettings>) => {
+    if (!allowed('settings', 'edit', 'updateCompanySettings')) return;
     setCompanySettings(prev => ({ ...prev, ...newSettings }));
     addAuditLog('PARAMETRES_ENTREPRISE', 'Configuration', 'Mise à jour des paramètres généraux');
   };
 
   const updateZKTecoConfig = (config: Partial<ZKTecoDeviceConfig>) => {
+    if (!allowed('settings', 'edit', 'updateZKTecoConfig')) return;
     setZKTecoConfig(prev => ({ ...prev, ...config }));
     addAuditLog('PARAMETRES_ZKTECO', 'Appareil de pointage', 'Mise à jour de la configuration ZKTeco');
   };
 
-  const testZKTecoConnection = async () => {
-    // Simulate real network TCP handshake
-    setZKTecoConfig(prev => ({ ...prev, status: 'SYNCHRONIZING' }));
-    await new Promise(resolve => setTimeout(resolve, 1400));
-    
-    const isOnline = zktecoConfig.ipAddress.length > 5;
-    const latency = Math.floor(18 + Math.random() * 25);
-    
-    if (isOnline) {
-      setZKTecoConfig(prev => ({ 
-        ...prev, 
-        status: 'ONLINE',
-        lastSyncTime: new Date().toISOString().replace('T', ' ').substring(0, 19)
-      }));
-      addAuditLog('TEST_CONNEXION_ZKTECO', `${zktecoConfig.ipAddress}:${zktecoConfig.port}`, `Succès (Ping: ${latency}ms)`);
-      return { success: true, message: `Connexion TCP réussie avec ${zktecoConfig.model} (Latence: ${latency}ms, Protocole ZKEMkeeper OK).`, latencyMs: latency };
-    } else {
-      setZKTecoConfig(prev => ({ ...prev, status: 'OFFLINE', errorCount: prev.errorCount + 1 }));
-      addAuditLog('TEST_CONNEXION_ZKTECO', zktecoConfig.ipAddress, 'Échec de la connexion');
-      return { success: false, message: `Échec de connexion sur ${zktecoConfig.ipAddress}:${zktecoConfig.port}. Vérifiez le câble réseau ou l'adresse IP.`, latencyMs: 0 };
-    }
-  };
-
-  const syncZKTecoNow = async () => {
-    setZKTecoConfig(prev => ({ ...prev, status: 'SYNCHRONIZING' }));
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    const todayStr = '2026-10-11';
-    const nowTime = '08:45';
-    let imported = 0;
-
-    // Simulate clock-in arrivals from device buffer for today
-    setAttendanceRecords(prev => {
-      return prev.map(rec => {
-        if (rec.date === todayStr && !rec.actualCheckIn) {
-          const emp = employees.find(e => e.matricule === rec.employeeId);
-          if (emp && (emp.matricule === 'PRM-004' || emp.matricule === 'PRM-013')) {
-            imported++;
-            const { status, lateMinutes } = calculateStatus(emp.heureEntreeNormale, nowTime, emp.toleranceMinutes);
-            return {
-              ...rec,
-              actualCheckIn: nowTime,
-              status,
-              lateMinutes,
-              source: 'ZKTECO_BIOMETRIC',
-              rawPunchInTime: `${todayStr} ${nowTime}:12`
-            };
-          }
-        }
-        return rec;
-      });
+  const applyAttendanceImport = (fileName: string, days: DayAttendance[], warnings: string[] = [], markAbsents = true) => {
+    if (!allowed('attendance', 'create', 'applyAttendanceImport')) return { count: 0, absents: 0, dates: [] };
+    // Une journée par agent : premier pointage = entrée, dernier = sortie. Les agents actifs sans aucun
+    // pointage ces jours-là sont marqués absents (sauf s'ils ont déjà une ligne dans le carnet).
+    const toMin = (t: string) => Number(t.slice(0, 2)) * 60 + Number(t.slice(3, 5));
+    const records: AttendanceRecord[] = days.map(({ emp, date, checkIn, checkOut, punches }) => {
+      const { status, lateMinutes } = calculateStatus(emp.heureEntreeNormale, checkIn, emp.toleranceMinutes);
+      return {
+        id: `att-${emp.matricule}-${date}`,
+        employeeId: emp.matricule,
+        employeeName: `${emp.nom} ${emp.postnom} ${emp.prenom}`,
+        department: emp.departement,
+        date,
+        expectedCheckIn: emp.heureEntreeNormale,
+        actualCheckIn: checkIn,
+        lateMinutes,
+        expectedCheckOut: emp.heureSortieNormale,
+        actualCheckOut: checkOut,
+        earlyDepartureMinutes: checkOut ? Math.max(0, toMin(emp.heureSortieNormale) - toMin(checkOut)) : 0,
+        status,
+        source: 'FILE_IMPORT',
+        rawPunchInTime: `${date} ${punches.join(' / ')}`,
+        // Tous les pointages lus sont conservés et visibles dans le carnet
+        notes: `Pointeuse : ${punches.join(' · ')} — fichier ${fileName}`
+      };
     });
+    const dates = [...new Set(days.map(d => d.date))];
+    const existing = new Set(attendanceRecords.map(r => `${r.employeeId}|${r.date}`));
+    const absents: AttendanceRecord[] = !markAbsents ? [] : absentCandidates(days, employees, existing, companySettings.workingDays || []).map(({ date, emp }) => ({
+      id: `att-${emp.matricule}-${date}`,
+      employeeId: emp.matricule,
+      employeeName: `${emp.nom} ${emp.postnom} ${emp.prenom}`,
+      department: emp.departement,
+      date,
+      expectedCheckIn: emp.heureEntreeNormale,
+      actualCheckIn: null,
+      lateMinutes: 0,
+      expectedCheckOut: emp.heureSortieNormale,
+      actualCheckOut: null,
+      earlyDepartureMinutes: 0,
+      status: 'ABSENT',
+      source: 'FILE_IMPORT',
+      notes: `Aucun pointage pour ce jour dans ${fileName}`
+    }));
+    if (!records.length) return { count: 0, absents: 0, dates };
 
+    bulkImportAttendance([...records, ...absents], `Fichier de la pointeuse importé : ${fileName}`);
+    // Le tableau de bord, le carnet et les rapports s'ouvrent ensuite sur le dernier jour importé
+    setWorkingDate(dates.sort()[dates.length - 1]);
     const newLog: SyncLogEntry = {
-      id: `syn-${Date.now()}`,
+      id: `file-${Date.now()}`,
       timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
-      type: 'MANUAL_TRIGGER',
-      punchesImported: imported > 0 ? imported : 12,
-      newPunches: imported > 0 ? imported : 12,
-      duplicatesSkipped: 24,
-      status: 'SUCCESS',
-      message: `Synchronisation directe terminée. ${imported > 0 ? imported : 12} pointages biométriques récupérés.`,
+      type: 'USB_FILE_IMPORT',
+      punchesImported: records.length,
+      newPunches: records.length,
+      duplicatesSkipped: 0,
+      status: warnings.length > 0 ? 'WARNING' : 'SUCCESS',
+      message: `Import de « ${fileName} » : ${records.length} présence(s), ${absents.length} absence(s), ${warnings.length} avertissement(s).`,
       operatorName: currentUser?.name
     };
-
     setZKTecoConfig(prev => ({
       ...prev,
-      status: 'ONLINE',
-      lastSyncTime: new Date().toISOString().replace('T', ' ').substring(0, 19),
-      importedPunchesCount: prev.importedPunchesCount + (imported > 0 ? imported : 12),
+      lastPunchImportedTime: newLog.timestamp,
+      importedPunchesCount: prev.importedPunchesCount + records.length,
       syncLogs: [newLog, ...prev.syncLogs]
     }));
-
-    addAuditLog('SYNCHRONISATION_ZKTECO', zktecoConfig.model, `${imported > 0 ? imported : 12} pointages importés`);
-    return { success: true, punchesImported: imported > 0 ? imported : 12, message: 'Synchronisation ZKTeco achevée avec succès.' };
-  };
-
-  const importZKTecoFile = async (fileName: string, fileContent: string) => {
-    // Parser for ZKTeco standard export (CSV, DAT, TXT)
-    const lines = fileContent.split('\n').filter(l => l.trim().length > 0);
-    const errors: string[] = [];
-    const validRecords: AttendanceRecord[] = [];
-
-    lines.forEach((line, idx) => {
-      // Can be tab-separated, comma-separated or space-separated
-      const parts = line.split(/[,\t ]+/).map(p => p.trim());
-      if (parts.length >= 2) {
-        // e.g. "1 2026-10-11 08:15:30 1 0" (bioId, date, time, state)
-        // or "PRM-001,2026-10-11,08:15:00,16:30:00"
-        let bioIdOrMatricule = parts[0];
-        let datePart = parts[1];
-        let timePart = parts[2] || '08:30';
-
-        // Check if matching employee
-        const emp = employees.find(e => e.zktecoBioId === bioIdOrMatricule || e.matricule.toLowerCase() === bioIdOrMatricule.toLowerCase());
-        if (!emp) {
-          errors.push(`Ligne ${idx + 1}: ID biométrique ou matricule "${bioIdOrMatricule}" inconnu dans la base.`);
-          return;
-        }
-
-        // Validate time format (HH:mm)
-        const cleanTime = timePart.substring(0, 5);
-        const { status, lateMinutes } = calculateStatus(emp.heureEntreeNormale, cleanTime, emp.toleranceMinutes);
-
-        validRecords.push({
-          id: `att-${emp.matricule}-${datePart || '2026-10-11'}`,
-          employeeId: emp.matricule,
-          employeeName: `${emp.nom} ${emp.postnom} ${emp.prenom}`,
-          department: emp.departement,
-          date: datePart || '2026-10-11',
-          expectedCheckIn: emp.heureEntreeNormale,
-          actualCheckIn: cleanTime,
-          lateMinutes,
-          expectedCheckOut: emp.heureSortieNormale,
-          actualCheckOut: '16:30',
-          earlyDepartureMinutes: 0,
-          status, // Strictly PRESENT | RETARD | ABSENT
-          source: 'FILE_IMPORT',
-          rawPunchInTime: `${datePart} ${timePart}`,
-          notes: `Importé depuis le fichier ${fileName}`
-        });
-      }
-    });
-
-    if (validRecords.length > 0) {
-      bulkImportAttendance(validRecords, `Fichier USB/CSV importé: ${fileName}`);
-      
-      const newLog: SyncLogEntry = {
-        id: `file-${Date.now()}`,
-        timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        type: 'USB_FILE_IMPORT',
-        punchesImported: validRecords.length,
-        newPunches: validRecords.length,
-        duplicatesSkipped: 0,
-        status: errors.length > 0 ? 'WARNING' : 'SUCCESS',
-        message: `Import du fichier "${fileName}" terminé: ${validRecords.length} pointages valides, ${errors.length} rejets.`,
-        operatorName: currentUser?.name
-      };
-
-      setZKTecoConfig(prev => ({
-        ...prev,
-        lastPunchImportedTime: new Date().toISOString().replace('T', ' ').substring(0, 19),
-        importedPunchesCount: prev.importedPunchesCount + validRecords.length,
-        syncLogs: [newLog, ...prev.syncLogs]
-      }));
-
-      return { success: true, count: validRecords.length, errors };
-    }
-
-    return { success: false, count: 0, errors };
+    return { count: records.length, absents: absents.length, dates };
   };
 
   // Sanctions Actions
   const addSanctionRule = (ruleData: Omit<SanctionRule, 'id'>) => {
+    if (!allowed('sanctions', 'create', 'addSanctionRule')) return;
     const newRule: SanctionRule = {
       ...ruleData,
       id: `rule-${Date.now()}`
@@ -571,114 +566,100 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateSanctionRule = (id: string, ruleData: Partial<SanctionRule>) => {
+    if (!allowed('sanctions', 'edit', 'updateSanctionRule')) return;
     setSanctionRules(prev => prev.map(r => r.id === id ? { ...r, ...ruleData } : r));
     addAuditLog('MODIFICATION_REGLE_SANCTION', id, 'Mise à jour des critères de sanction');
   };
 
   const deleteSanctionRule = (id: string) => {
+    if (!allowed('sanctions', 'delete', 'deleteSanctionRule')) return;
     setSanctionRules(prev => prev.filter(r => r.id !== id));
     addAuditLog('SUPPRESSION_REGLE_SANCTION', id, 'Suppression d\'un barème de sanction');
   };
 
-  const reviewSanctionCase = (id: string, newStatus: SanctionStatus, motif: string, approvedAmount?: number) => {
-    const sc = sanctionCases.find(c => c.id === id);
-    if (!sc) return;
-
-    const finalAmount = approvedAmount !== undefined ? approvedAmount : sc.deductionAmount;
-
-    const updated: SanctionCase = {
-      ...sc,
-      status: newStatus,
+  const decideSanction = (proposal: SanctionProposal, status: 'APPROUVEE' | 'REJETEE', motif: string) => {
+    if (!allowed('sanctions', 'validate', 'decideSanction')) return;
+    const { emp, month, rule } = proposal;
+    const id = `case-${emp.matricule}-${month}`;
+    const decided: SanctionCase = {
+      id,
+      employeeId: emp.matricule,
+      matricule: emp.matricule,
+      employeeName: `${emp.nom} ${emp.postnom} ${emp.prenom}`,
+      department: emp.departement,
+      period: month,
+      lateCount: proposal.lateCount,
+      totalMinutesLate: proposal.lateMinutes,
+      datesLate: proposal.lateDates,
+      absenceCount: proposal.absences,
+      datesAbsent: proposal.absenceDates,
+      ruleId: rule.id,
+      ruleName: rule.name,
+      proposedSanction: rule.sanctionType,
+      deductionAmount: rule.deductionAmount,
+      approvedDeductionAmount: status === 'APPROUVEE' ? rule.deductionAmount : 0,
+      currency: rule.currency,
+      status,
       decisionDate: new Date().toISOString().substring(0, 10),
-      decidedBy: currentUser ? `${currentUser.name} (${currentUser.role})` : 'Direction',
+      decidedBy: currentUser ? `${currentUser.name} (${getRoleLabel(currentUser.role)})` : 'Direction',
       decisionMotif: motif,
-      approvedDeductionAmount: newStatus === 'APPROUVEE' ? finalAmount : 0
+      createdAt: new Date().toISOString(),
     };
-
-    setSanctionCases(prev => prev.map(c => c.id === id ? updated : c));
-    addAuditLog(
-      newStatus === 'APPROUVEE' ? 'APPROBATION_SANCTION' : 'REJET_SANCTION',
-      `${sc.matricule} - ${sc.employeeName}`,
-      `Statut: ${newStatus}, Décision: ${sc.proposedSanction}, Retenue salariale: ${newStatus === 'APPROUVEE' ? finalAmount : 0} ${sc.currency}, Motif: ${motif}`
-    );
+    // Une seule décision par employé et par mois (les anciens dossiers du même mois sont remplacés)
+    setSanctionCases(prev => [decided, ...prev.filter(c => !((c.matricule === emp.matricule || c.employeeId === emp.matricule) && caseMonth(c.period) === month))]);
+    addAuditLog(status === 'APPROUVEE' ? 'APPROBATION_SANCTION' : 'REJET_SANCTION', `${emp.matricule} - ${month}`,
+      `${rule.name} · ${rule.sanctionType}${rule.exclusionDays ? ` (${rule.exclusionDays} j)` : ''}${rule.deductionAmount ? ` · ${rule.deductionAmount} ${rule.currency}` : ''} · Motif : ${motif}`);
   };
 
-  // Translations dictionary
-  const translations: Record<string, { fr: string; en: string }> = {
-    // Navigation
-    'nav.dashboard': { fr: 'Tableau de bord', en: 'Dashboard' },
-    'nav.employees': { fr: 'Employés', en: 'Employees' },
-    'nav.attendance': { fr: 'Présences', en: 'Attendance' },
-    'nav.reports': { fr: 'Rapports & Documents', en: 'Reports & Docs' },
-    'nav.sanctions': { fr: 'Retards & Sanctions', en: 'Tardiness & Sanctions' },
-    'nav.settings': { fr: 'Paramètres', en: 'Settings' },
-
-    // Statuses
-    'status.present': { fr: 'Présent', en: 'Present' },
-    'status.retard': { fr: 'Retard', en: 'Late' },
-    'status.absent': { fr: 'Absent', en: 'Absent' },
-
-    // Actions
-    'action.save': { fr: 'Enregistrer', en: 'Save' },
-    'action.cancel': { fr: 'Annuler', en: 'Cancel' },
-    'action.export': { fr: 'Exporter', en: 'Export' },
-    'action.print': { fr: 'Imprimer', en: 'Print' },
-    'action.filter': { fr: 'Filtrer', en: 'Filter' },
-    'action.search': { fr: 'Rechercher', en: 'Search' },
-    'action.punchNow': { fr: 'Pointer maintenant', en: 'Punch In/Out' },
-    'action.syncZk': { fr: 'Synchroniser ZKTeco', en: 'Sync ZKTeco' },
-    'action.correct': { fr: 'Corriger pointage', en: 'Correct Punch' },
-    'action.addEmployee': { fr: 'Ajouter un employé', en: 'Add Employee' }
-  };
-
-  const t = (key: string): string => {
-    if (translations[key]) {
-      return translations[key][language] || key;
-    }
-    return key;
-  };
 
   return (
     <AppContext.Provider value={{
       theme,
-      setTheme,
-      toggleTheme,
-      language,
-      setLanguage,
       currentView,
-      setCurrentView,
+      setCurrentView: goToView,
+      carnetEmployee,
+      openEmployeeCarnet,
+      reportTab,
+      reportMonth,
+      openReport,
       currentUser,
       setCurrentUser,
-      switchUserRole,
       allUsers,
+      addUser,
+      updateUser,
+      deleteUser,
+      roles,
+      addRole,
+      updateRole,
+      deleteRole,
+      getRoleLabel,
+      can,
+      canOpen,
       companySettings,
       updateCompanySettings,
       departments,
       addDepartment,
-      updateDepartment,
       employees,
       addEmployee,
       updateEmployee,
       deleteEmployee,
       attendanceRecords,
-      recordPunch,
       correctAttendance,
-      bulkImportAttendance,
       zktecoConfig,
       updateZKTecoConfig,
-      testZKTecoConnection,
-      syncZKTecoNow,
-      importZKTecoFile,
+      applyAttendanceImport,
+      workingDate,
       sanctionRules,
       addSanctionRule,
       updateSanctionRule,
       deleteSanctionRule,
       sanctionCases,
-      reviewSanctionCase,
+      decideSanction,
       auditLogs,
       addAuditLog,
       calculateStatus,
-      t
+      storageIssues,
+      dismissStorageIssues
     }}>
       {children}
     </AppContext.Provider>

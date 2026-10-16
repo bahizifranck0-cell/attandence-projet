@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import { Navbar } from './components/layout/Navbar';
 import { Sidebar } from './components/layout/Sidebar';
@@ -9,41 +9,58 @@ import { ReportsView } from './components/reports/ReportsView';
 import { SanctionsView } from './components/sanctions/SanctionsView';
 import { SettingsView } from './components/settings/SettingsView';
 import { LoginView } from './components/auth/LoginView';
-import { QuickPunchModal } from './components/modals/QuickPunchModal';
 import { CorrectAttendanceModal } from './components/modals/CorrectAttendanceModal';
 import { GlobalSearchModal } from './components/modals/GlobalSearchModal';
+import { StartupIntro } from './components/login/StartupIntro';
 import { AttendanceRecord } from './types';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
+import { StorageBanner } from './components/common/StorageBanner';
 
 function MainApp() {
-  const { currentUser, currentView } = useApp();
+  const { currentUser, currentView, setCurrentView, canOpen } = useApp();
 
-  const [isQuickPunchOpen, setIsQuickPunchOpen] = useState(false);
   const [correctingRecord, setCorrectingRecord] = useState<AttendanceRecord | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
+
+  // Si le module affiché n'est pas autorisé pour ce rôle, on bascule sur le premier module permis
+  const allowedViews = (['dashboard', 'employees', 'attendance', 'reports', 'sanctions', 'settings'] as const).filter(v => canOpen(v));
+  useEffect(() => {
+    if (currentUser && !canOpen(currentView) && allowedViews.length > 0) {
+      setCurrentView(allowedViews[0]);
+    }
+  });
 
   // If not logged in, show authentic Login page
   if (!currentUser) {
     return <LoginView />;
   }
 
+  if (allowedViews.length === 0) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6 text-center">
+        <div className="glass-card rounded-2xl p-8 max-w-md space-y-2">
+          <h1 className="text-2xl">Aucun module autorisé</h1>
+          <p className="text-sm text-muted">Le rôle de votre compte ne donne accès à aucun module. Demandez à l'administrateur de vous attribuer des permissions.</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-[#F2F1FA] dark:bg-[#0B0F19] text-[#1D2030] dark:text-[#E2E8F0] flex flex-col transition-colors selection:bg-[#7C4DFF] selection:text-white">
-      {/* Top Navbar */}
-      <Navbar 
-        onOpenQuickPunch={() => setIsQuickPunchOpen(true)}
-        onOpenSearch={() => setIsSearchOpen(true)}
-      />
+    <div className="min-h-screen bg-app text-slate-900 flex flex-col lg:flex-row selection:bg-brand selection:text-white">
+      {/* Menu latéral (même structure que PREMIDIS ERP) */}
+      <Sidebar />
 
-      {/* Main Body */}
-      <div className="flex-1 flex max-w-[1600px] w-full mx-auto">
-        {/* Navigation Sidebar */}
-        <Sidebar />
+      <div className="flex-1 flex flex-col min-w-0 min-h-screen">
+        {/* Barre d'outils : recherche, horloge, langue, thème, utilisateur */}
+        <StorageBanner />
+        <Navbar
+          onOpenSearch={() => setIsSearchOpen(true)}
+        />
 
-        {/* Content Viewport */}
-        <main className="flex-1 p-6 lg:p-8 overflow-y-auto max-w-[calc(100vw-16rem)]">
+        <main className="flex-1 px-4 pt-4 pb-28 lg:pb-8 lg:px-6 w-full max-w-[1400px] mx-auto">
           {currentView === 'dashboard' && (
             <DashboardView 
-              onOpenQuickPunch={() => setIsQuickPunchOpen(true)}
               onOpenCorrectModal={(rec) => setCorrectingRecord(rec)}
             />
           )}
@@ -54,7 +71,6 @@ function MainApp() {
 
           {currentView === 'attendance' && (
             <AttendanceView 
-              onOpenQuickPunch={() => setIsQuickPunchOpen(true)}
               onOpenCorrectModal={(rec) => setCorrectingRecord(rec)}
             />
           )}
@@ -74,11 +90,6 @@ function MainApp() {
       </div>
 
       {/* Global Modals */}
-      <QuickPunchModal 
-        isOpen={isQuickPunchOpen}
-        onClose={() => setIsQuickPunchOpen(false)}
-      />
-
       {correctingRecord && (
         <CorrectAttendanceModal 
           record={correctingRecord}
@@ -94,10 +105,18 @@ function MainApp() {
   );
 }
 
+function Startup() {
+  const { currentUser } = useApp();
+  return <StartupIntro hasSession={!!currentUser} />;
+}
+
 export default function App() {
   return (
-    <AppProvider>
-      <MainApp />
-    </AppProvider>
+    <ErrorBoundary>
+      <AppProvider>
+        <Startup />
+        <MainApp />
+      </AppProvider>
+    </ErrorBoundary>
   );
 }
